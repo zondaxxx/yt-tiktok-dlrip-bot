@@ -1,0 +1,13 @@
+__pycache__/
+.venv/
+venv/
+.env
+*.log
+*.tmp
+*.part
+*.webm
+*.mkv
+*.ytdl
+downloads/
+dist/
+build/

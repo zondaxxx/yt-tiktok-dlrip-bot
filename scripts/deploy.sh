@@ -122,8 +122,8 @@ auth_youtube_flow() {
   read -r -p "Configure YouTube cookies now? (y/N): " ans || true
   case "${ans,,}" in
     y|yes)
-      echo "Methods:"; echo "  1) Use existing cookies.txt path"; echo "  2) Import from local browser"
-      read -r -p "Choose method [1/2]: " method || true
+      echo "Methods:"; echo "  1) Use existing cookies.txt path"; echo "  2) Import from local browser"; echo "  3) Sign in Google (opens Chrome) and auto-capture cookies"
+      read -r -p "Choose method [1/2/3]: " method || true
       if [ "${method}" = "1" ]; then
         read -r -p "Path to cookies.txt (Netscape format): " CK || true
         if [ -f "$CK" ]; then
@@ -135,11 +135,15 @@ auth_youtube_flow() {
         else
           warn "File not found: $CK"
         fi
-      else
+      elif [ "${method}" = "2" ]; then
         read -r -p "Browser (chrome/firefox/chromium/safari/edge): " B || true
         # shellcheck disable=SC1090
         source "${WORKDIR}/${VENVDIR}/bin/activate"
         python -m tools.ytdlp_auth --from-browser "${B:-chrome}" --out "${WORKDIR}/cookies.txt" --set-env || warn "Browser import failed"
+      else
+        # shellcheck disable=SC1090
+        source "${WORKDIR}/${VENVDIR}/bin/activate"
+        python -m tools.google_auth_flow || warn "Google sign-in flow failed"
       fi
       ;;
     *)

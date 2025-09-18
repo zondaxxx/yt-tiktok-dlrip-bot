@@ -8,7 +8,11 @@ set -euo pipefail
 SERVICE_NAME=${SERVICE_NAME:-yt-dlp-bot}
 PYTHON_BIN=${PYTHON_BIN:-python3}
 VENVDIR=${VENVDIR:-.venv}
-WORKDIR=${WORKDIR:-$(pwd)}
+
+# Resolve repo dir relative to this script's location
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+WORKDIR=${WORKDIR:-${REPO_DIR}}
 RUN_USER=${RUN_USER:-$(id -un)}
 SYSTEMD_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
@@ -31,21 +35,30 @@ ensure_deps() {
 }
 
 ensure_venv() {
-  info "Creating venv at ${VENVDIR}"
-  if [ ! -d "${VENVDIR}" ]; then
-    ${PYTHON_BIN} -m venv "${VENVDIR}"
+  info "Creating venv at ${WORKDIR}/${VENVDIR}"
+  mkdir -p "${WORKDIR}"
+  if [ ! -d "${WORKDIR}/${VENVDIR}" ]; then
+    ${PYTHON_BIN} -m venv "${WORKDIR}/${VENVDIR}"
   fi
   # shellcheck disable=SC1090
-  source "${VENVDIR}/bin/activate"
+  source "${WORKDIR}/${VENVDIR}/bin/activate"
   python -m pip install --upgrade pip
-  pip install -r requirements.txt
+  if [ ! -f "${WORKDIR}/requirements.txt" ]; then
+    err "requirements.txt not found in ${WORKDIR}. Set WORKDIR to your project root or run the script from repo."
+    exit 2
+  fi
+  pip install -r "${WORKDIR}/requirements.txt"
 }
 
 prompt_env() {
   info "Preparing .env"
-  local env_file=.env
+  local env_file="${WORKDIR}/.env"
   if [ ! -f "$env_file" ]; then
-    cp .env.example "$env_file" || true
+    if [ -f "${WORKDIR}/.env.example" ]; then
+      cp "${WORKDIR}/.env.example" "$env_file" || true
+    else
+      touch "$env_file"
+    fi
   fi
   # Read current values if exist
   local BOT_TOKEN TG_API_ID TG_API_HASH TG_SESSION_STRING BYPASS_MODE
@@ -124,9 +137,9 @@ start_service() {
 }
 
 git_update_if_any() {
-  if [ -d .git ]; then
+  if [ -d "${WORKDIR}/.git" ]; then
     info "Pulling latest changes"
-    git pull --ff-only || warn "git pull failed"
+    git -C "${WORKDIR}" pull --ff-only || warn "git pull failed"
   fi
 }
 
@@ -147,7 +160,7 @@ case "${1:-install}" in
     # Re-generate session string only
     ensure_venv
     read -r -p "Phone (+7999…): " TG_PHONE || true
-    source "${VENVDIR}/bin/activate"
+    source "${WORKDIR}/${VENVDIR}/bin/activate"
     TG_PHONE="$TG_PHONE" WRITE_ENV=1 python -m tools.gen_session_for_number || true
     ;;
   restart)

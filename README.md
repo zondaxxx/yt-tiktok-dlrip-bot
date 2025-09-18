@@ -66,6 +66,8 @@ SERVICE_NAME=yt-dlp-bot ./scripts/deploy.sh install
 
 Команды обслуживания:
 - `./scripts/deploy.sh update` — обновить зависимости и перезапустить
+- `./scripts/deploy.sh enable-auto-update` — включить авто‑обновление (daily) с Git и рестарт
+- `./scripts/deploy.sh disable-auto-update` — выключить авто‑обновление
 - `./scripts/deploy.sh restart` — перезапуск сервиса
 - `./scripts/deploy.sh status` — статус
 - `./scripts/deploy.sh logs` — логи (journalctl)
@@ -88,6 +90,23 @@ SERVICE_NAME=yt-dlp-bot ./scripts/deploy.sh install
 - Для приватных/закрытых видео скачивание работать не будет.
 - В редких случаях прямые ссылки от `yt-dlp` могут быть временными.
 - Лимит отправки больших файлов ботом ограничен Telegram. Бот автоматически отдаёт прямую ссылку, если файл больше лимита загрузки. Порог прямых ссылок установлен до ~4 ГБ.
+
+### YouTube: требуется авторизация / cookies
+Если видите в логах `Sign in to confirm you’re not a bot`, добавьте cookies для yt-dlp:
+- Вариант 1 (рекомендуется): экспортируйте cookies в формате Netscape с вашего браузера (расширение “Get cookies.txt Locally”), сохраните как `cookies.txt` на сервере и укажите путь в `.env`:
+  - `YTDLP_COOKIES_FILE=/path/to/cookies.txt`
+- Вариант 2: если сервер — это ваша машина с браузером и активной сессией, можно подключить импорт из браузера:
+  - `YTDLP_COOKIES_FROM_BROWSER=chrome` (или `firefox`/`chromium`)
+
+После изменения `.env` перезапустите бота (`scripts/deploy.sh restart` или `python -m app.main`).
+
+CLI-помощник для cookies
+- Извлечь куки из браузера и записать в .env:
+  ```
+  # Примеры: chrome | firefox | chromium | safari
+  python -m tools.ytdlp_auth --from-browser chrome --out cookies.txt --set-env
+  ```
+  После этого перезапустите бота.
 
 ## Структура
 - `app/main.py` — запуск бота и диспетчера

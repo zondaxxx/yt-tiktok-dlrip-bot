@@ -7,6 +7,12 @@ from typing import Optional, Tuple, List, Dict, Callable
 
 import yt_dlp as ytdlp
 
+# Support running both as a module and as a script
+try:
+    from .config import get_ytdlp_cookies_file, get_ytdlp_cookies_from_browser  # type: ignore
+except Exception:  # pragma: no cover
+    from config import get_ytdlp_cookies_file, get_ytdlp_cookies_from_browser
+
 
 # Максимальный размер файла для отдачи пользователю через прямую ссылку
 # (не загружаем в Telegram, но позволяем получить URL):
@@ -189,6 +195,14 @@ def _download(
             elif status == "finished":
                 on_progress("finished", int(d.get("downloaded_bytes") or 0), int(d.get("total_bytes") or 0), None, None)
 
+        cookies_file = get_ytdlp_cookies_file()
+        cookies_browser = get_ytdlp_cookies_from_browser()
+        cookies_opts: Dict = {}
+        if cookies_file:
+            cookies_opts["cookiefile"] = cookies_file
+        elif cookies_browser:
+            cookies_opts["cookiesfrombrowser"] = (cookies_browser,)
+
         ydl_opts = {
             "format": format_selector,
             "outtmpl": os.path.join(temp_dir, "%(title).180B [%(id)s].%(ext)s"),
@@ -204,6 +218,7 @@ def _download(
                 }
             ],
             "progress_hooks": [_hook],
+            **cookies_opts,
         }
 
         with ytdlp.YoutubeDL(ydl_opts) as ydl:
@@ -543,6 +558,14 @@ def _download_with_selector(
         elif status == "finished":
             on_progress("finished", int(d.get("downloaded_bytes") or 0), int(d.get("total_bytes") or 0), None, None)
 
+    cookies_file = get_ytdlp_cookies_file()
+    cookies_browser = get_ytdlp_cookies_from_browser()
+    cookies_opts: Dict = {}
+    if cookies_file:
+        cookies_opts["cookiefile"] = cookies_file
+    elif cookies_browser:
+        cookies_opts["cookiesfrombrowser"] = (cookies_browser,)
+
     ydl_opts = {
         "format": selector,
         "outtmpl": os.path.join(temp_dir, "%(title).180B [%(id)s].%(ext)s"),
@@ -558,6 +581,7 @@ def _download_with_selector(
             }
         ],
         "progress_hooks": [_hook],
+        **cookies_opts,
     }
     try:
         with ytdlp.YoutubeDL(ydl_opts) as ydl:

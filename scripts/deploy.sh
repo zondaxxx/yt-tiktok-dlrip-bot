@@ -103,6 +103,50 @@ prompt_env() {
   info ".env saved"
 }
 
+update_env_kv() {
+  local env_file="${WORKDIR}/.env"
+  local key="$1"; shift
+  local val="$1"; shift || true
+  touch "$env_file"
+  if grep -qE "^${key}=" "$env_file"; then
+    sed -i "" -e "s|^${key}=.*|${key}=${val}|" "$env_file" 2>/dev/null || \
+    sed -i -e "s|^${key}=.*|${key}=${val}|" "$env_file" 2>/dev/null || true
+  else
+    echo "${key}=${val}" >> "$env_file"
+  fi
+}
+
+auth_youtube_flow() {
+  info "YouTube auth (cookies) setup"
+  local env_file="${WORKDIR}/.env"
+  read -r -p "Configure YouTube cookies now? (y/N): " ans || true
+  case "${ans,,}" in
+    y|yes)
+      echo "Methods:"; echo "  1) Use existing cookies.txt path"; echo "  2) Import from local browser"
+      read -r -p "Choose method [1/2]: " method || true
+      if [ "${method}" = "1" ]; then
+        read -r -p "Path to cookies.txt (Netscape format): " CK || true
+        if [ -f "$CK" ]; then
+          mkdir -p "${WORKDIR}"
+          local dest="${WORKDIR}/cookies.txt"
+          cp "$CK" "$dest"
+          update_env_kv "YTDLP_COOKIES_FILE" "$dest"
+          info "Saved cookies to $dest and updated .env"
+        else
+          warn "File not found: $CK"
+        fi
+      else
+        read -r -p "Browser (chrome/firefox/chromium/safari/edge): " B || true
+        # shellcheck disable=SC1090
+        source "${WORKDIR}/${VENVDIR}/bin/activate"
+        python -m tools.ytdlp_auth --from-browser "${B:-chrome}" --out "${WORKDIR}/cookies.txt" --set-env || warn "Browser import failed"
+      fi
+      ;;
+    *)
+      ;;
+  esac
+}
+
 write_service() {
   info "Writing systemd service to ${SYSTEMD_FILE} (user=${RUN_USER})"
   tmpfile=$(mktemp)
@@ -148,6 +192,7 @@ case "${1:-install}" in
     ensure_deps
     ensure_venv
     prompt_env
+    auth_youtube_flow
     write_service
     start_service
     ;;
@@ -155,6 +200,56 @@ case "${1:-install}" in
     git_update_if_any
     ensure_venv
     start_service
+    ;;
+  yt-auth)
+    ensure_venv
+    auth_youtube_flow
+    ;;
+  enable-auto-update)
+    # Create a systemd timer + service for periodic updates
+    info "Installing auto-update timer"
+    UPD_SVC="/etc/systemd/system/${SERVICE_NAME}-update.service"
+    UPD_TMR="/etc/systemd/system/${SERVICE_NAME}-update.timer"
+    tmp1=$(mktemp)
+    cat >"${tmp1}" <<EOF
+[Unit]
+Description=Auto-update ${SERVICE_NAME} from Git and restart
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=${RUN_USER}
+WorkingDirectory=${WORKDIR}
+ExecStart=${WORKDIR}/scripts/deploy.sh update
+EOF
+    sudo mv "${tmp1}" "${UPD_SVC}"
+    sudo chmod 0644 "${UPD_SVC}"
+
+    tmp2=$(mktemp)
+    cat >"${tmp2}" <<EOF
+[Unit]
+Description=Daily auto-update for ${SERVICE_NAME}
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+    sudo mv "${tmp2}" "${UPD_TMR}"
+    sudo chmod 0644 "${UPD_TMR}"
+    sudo systemctl daemon-reload
+    sudo systemctl enable "${SERVICE_NAME}-update.timer"
+    sudo systemctl start "${SERVICE_NAME}-update.timer"
+    sudo systemctl status "${SERVICE_NAME}-update.timer" --no-pager -l || true
+    ;;
+  disable-auto-update)
+    info "Disabling auto-update timer"
+    sudo systemctl stop "${SERVICE_NAME}-update.timer" || true
+    sudo systemctl disable "${SERVICE_NAME}-update.timer" || true
+    sudo rm -f "/etc/systemd/system/${SERVICE_NAME}-update.timer" "/etc/systemd/system/${SERVICE_NAME}-update.service" || true
+    sudo systemctl daemon-reload || true
     ;;
   session)
     # Re-generate session string only
@@ -187,7 +282,7 @@ case "${1:-install}" in
     info "Removed systemd unit"
     ;;
   *)
-    echo "Usage: $0 {install|update|session|restart|stop|start|status|logs|uninstall}" >&2
+    echo "Usage: $0 {install|update|yt-auth|enable-auto-update|disable-auto-update|session|restart|stop|start|status|logs|uninstall}" >&2
     exit 1
     ;;
 esac

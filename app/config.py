@@ -47,3 +47,18 @@ def get_bypass_mode() -> str:
     if mode not in {"off", "userbot"}:
         mode = "userbot"
     return mode
+
+
+def get_ytdlp_cookies_file() -> str | None:
+    _load_env_once()
+    path = (os.getenv("YTDLP_COOKIES_FILE") or "").strip()
+    if path and os.path.exists(path):
+        return path
+    return None
+
+
+def get_ytdlp_cookies_from_browser() -> str | None:
+    _load_env_once()
+    # Examples: chrome | chromium | firefox | safari (platform dependent)
+    val = (os.getenv("YTDLP_COOKIES_FROM_BROWSER") or "").strip()
+    return val or None

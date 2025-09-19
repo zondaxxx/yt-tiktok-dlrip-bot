@@ -7,6 +7,7 @@ import re
 import time
 from contextlib import suppress
 from dataclasses import dataclass
+from html import escape as html_escape
 from typing import Awaitable, Callable
 
 from aiogram import Router, F
@@ -154,6 +155,246 @@ def _options_from_payload(raw: object) -> list[FormatOption]:
             )
         )
     return options
+
+
+def _ext_priority(ext: str | None) -> int:
+    if not ext:
+        return 0
+    ext = ext.lower()
+    if ext == "mp4":
+        return 4
+    if ext in {"mkv", "mov"}:
+        return 3
+    if ext in {"webm", "m4a"}:
+        return 2
+    return 1
+
+
+def _dedupe_options(options: list[FormatOption]) -> list[FormatOption]:
+    unique: dict[tuple[str, str], FormatOption] = {}
+    for opt in options:
+        key = (opt.kind, str(opt.quality))
+        best = unique.get(key)
+        if not best:
+            unique[key] = opt
+            continue
+        # Prefer option with known size, smaller size, or better extension.
+        best_size = best.est_size or 0
+        opt_size = opt.est_size or 0
+        if best.est_size is None and opt.est_size is not None:
+            unique[key] = opt
+            continue
+        if opt.est_size is not None and best.est_size is not None and opt_size < best_size:
+            unique[key] = opt
+            continue
+        if opt.est_size == best.est_size and _ext_priority(opt.ext) > _ext_priority(best.ext):
+            unique[key] = opt
+    return list(unique.values())
+
+
+def _quality_value(opt: FormatOption) -> int:
+    quality = str(opt.quality or "").lower()
+    if quality == "best":
+        return 10000 + int(opt.height or 0)
+    if quality.isdigit():
+        return int(quality)
+    if opt.height:
+        return int(opt.height)
+    return 0
+
+
+def _format_size_localized(nbytes: int | None, lang: str) -> str:
+    text = human_size(nbytes or 0)
+    if lang == "en":
+        return (
+            text.replace("Б", "B")
+            .replace("К", "K")
+            .replace("М", "M")
+            .replace("Г", "G")
+            .replace("Т", "T")
+        )
+    return text
+
+
+def _quality_label(opt: FormatOption, lang: str) -> str:
+    if opt.height:
+        return f"{int(opt.height)}p"
+    quality = str(opt.quality or "").strip()
+    if quality.lower() == "best":
+        return t(lang, "quality_best_short")
+    if quality:
+        return quality
+    if opt.label:
+        return opt.label[:16]
+    return t(lang, "quality_unknown")
+
+
+def _format_option_label(
+    opt: FormatOption,
+    lang: str,
+    *,
+    mode: str,
+    tag: str | None = None,
+) -> str:
+    size = _format_size_localized(opt.est_size, lang)
+    quality = _quality_label(opt, lang)
+    if mode == "recommended" and tag in {"best", "compact", "audio", "video"}:
+        base = t(lang, f"opt_{tag}")
+        parts: list[str] = []
+        if tag != "audio" and quality not in {"", t(lang, "quality_unknown"), t(lang, "quality_best_short")}:
+            parts.append(quality)
+        if size != "?":
+            parts.append(f"~{size}")
+        if not parts and tag == "best" and size != "?":
+            parts.append(f"~{size}")
+        suffix = " · ".join(parts)
+        return f"{base} · {suffix}" if suffix else base
+    icon = {"va": "🎥", "v": "🎬", "a": "🎵"}.get(opt.kind, "📦")
+    parts: list[str] = []
+    if quality and quality != t(lang, "quality_unknown"):
+        parts.append(quality)
+    if opt.ext:
+        parts.append(opt.ext.upper())
+    if size != "?":
+        parts.append(f"~{size}")
+    return f"{icon} {' • '.join(parts) if parts else quality or icon}"[:64]
+
+
+def _pick_recommended_options(options: list[FormatOption]) -> list[tuple[str, FormatOption]]:
+    pool = _dedupe_options(options)
+    recommended: list[tuple[str, FormatOption]] = []
+    va_opts = [o for o in pool if o.kind == "va"]
+    v_opts = [o for o in pool if o.kind == "v"]
+    a_opts = [o for o in pool if o.kind == "a"]
+
+    used: set[tuple[str, str]] = set()
+
+    if va_opts:
+        va_sorted = sorted(va_opts, key=_quality_value, reverse=True)
+        best = va_sorted[0]
+        recommended.append(("best", best))
+        used.add((best.kind, best.quality))
+        sized = sorted(va_sorted, key=lambda o: o.est_size or 10**12)
+        if sized and sized[0] is not best:
+            recommended.append(("compact", sized[0]))
+            used.add((sized[0].kind, sized[0].quality))
+    elif v_opts:
+        v_sorted = sorted(v_opts, key=_quality_value, reverse=True)
+        recommended.append(("video", v_sorted[0]))
+        used.add((v_sorted[0].kind, v_sorted[0].quality))
+
+    if a_opts:
+        a_sorted = sorted(a_opts, key=_quality_value, reverse=True)
+        audio_pick = a_sorted[0]
+        if (audio_pick.kind, audio_pick.quality) not in used:
+            recommended.append(("audio", audio_pick))
+            used.add((audio_pick.kind, audio_pick.quality))
+
+    if len(recommended) < 2 and v_opts:
+        v_sorted = sorted(v_opts, key=_quality_value, reverse=True)
+        pick = v_sorted[0]
+        if (pick.kind, pick.quality) not in used:
+            recommended.append(("video", pick))
+            used.add((pick.kind, pick.quality))
+
+    return recommended[:3]
+
+
+def _build_recommend_keyboard(
+    token: str,
+    options: list[FormatOption],
+    lang: str,
+    url: str,
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for tag, opt in _pick_recommended_options(options):
+        label = _format_option_label(opt, lang, mode="recommended", tag=tag)
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=label[:64],
+                    callback_data=f"fmt|{token}|{opt.kind}|{opt.quality}",
+                )
+            ]
+        )
+
+    if len(_dedupe_options(options)) > len(rows):
+        rows.append([
+            InlineKeyboardButton(text=t(lang, "menu_more"), callback_data=f"menu|{token}|more")
+        ])
+
+    rows.append([InlineKeyboardButton(text=t(lang, "original"), url=url)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _build_full_keyboard(
+    token: str,
+    options: list[FormatOption],
+    lang: str,
+    url: str,
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    grouped = {"va": [], "v": [], "a": []}
+    for opt in _dedupe_options(options):
+        grouped.setdefault(opt.kind, []).append(opt)
+
+    for kind in ("va", "v", "a"):
+        chunk: list[InlineKeyboardButton] = []
+        opts = grouped.get(kind) or []
+        if not opts:
+            continue
+        for opt in sorted(opts, key=_quality_value, reverse=True):
+            label = _format_option_label(opt, lang, mode="full")
+            chunk.append(
+                InlineKeyboardButton(
+                    text=label[:64],
+                    callback_data=f"fmt|{token}|{opt.kind}|{opt.quality}",
+                )
+            )
+            if len(chunk) == 2:
+                rows.append(chunk)
+                chunk = []
+        if chunk:
+            rows.append(chunk)
+
+    rows.append([InlineKeyboardButton(text=t(lang, "menu_back"), callback_data=f"menu|{token}|back")])
+    rows.append([InlineKeyboardButton(text=t(lang, "original"), url=url)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _render_menu_text(payload: dict[str, object], lang: str, *, mode: str) -> str:
+    title = str(payload.get("title") or "")
+    duration = payload.get("duration")
+    parts: list[str] = []
+    if title:
+        parts.append(f"<b>{html_escape(title)}</b>")
+    if isinstance(duration, (int, float)) and duration > 0:
+        parts.append(t(lang, "meta_duration", value=human_time(duration)))
+    if parts:
+        parts.append("")
+    if mode == "full":
+        parts.append(t(lang, "menu_full"))
+    else:
+        parts.append(t(lang, "menu_recommended"))
+    parts.append(t(lang, "menu_hint"))
+    return "\n".join(part for part in parts if part)
+
+
+async def _edit_menu_message(message: Message | None, text: str, kb: InlineKeyboardMarkup) -> None:
+    if message is None:
+        return
+    try:
+        if message.photo or (message.caption is not None):
+            await message.edit_caption(text, reply_markup=kb)
+        else:
+            await message.edit_text(
+                text,
+                reply_markup=kb,
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+            )
+    except Exception:
+        with suppress(Exception):
+            await message.edit_reply_markup(reply_markup=kb)
 
 
 def _make_progress_editor(wait_msg: Message):
@@ -478,6 +719,8 @@ async def _deliver_result(job: DownloadJob, result: DownloadResult) -> None:
         token2 = put_payload({
             "target_chat_id": primary.origin_message.chat.id,
             "caption": caption,
+            "delivery_key": list(job.key),
+            "kind": result.kind or "document",
         })
         mark = f"UB|{token2}"
         cap2 = (caption + "\n\n" if caption else "") + mark
@@ -627,24 +870,65 @@ async def on_text_with_url(message: Message) -> None:
             await message.answer("Не удалось получить информацию о форматах. Проверьте ссылку.")
             return
 
-    token = put_payload({"url": url, "options": _options_to_payload(options)})
-
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text=t(lang, "cat_fast"), callback_data=f"cat|{token}|fast"),
-                InlineKeyboardButton(text=t(lang, "cat_best"), callback_data=f"cat|{token}|best"),
-            ],
-            [InlineKeyboardButton(text=t(lang, "cat_custom"), callback_data=f"cat|{token}|custom")],
-            [InlineKeyboardButton(text=t(lang, "original"), url=url)],
-        ]
-    )
-    caption = (basic.title or url) + (f"\n{human_time(basic.duration)}" if getattr(basic, "duration", None) else "")
+    payload = {
+        "url": url,
+        "options": _options_to_payload(options),
+        "title": basic.title,
+        "duration": basic.duration,
+    }
+    token = put_payload(payload)
+    keyboard = _build_recommend_keyboard(token, options, lang, url)
+    preview_text = _render_menu_text(payload, lang, mode="recommended")
     thumb = getattr(basic, "thumbnail", None)
     if thumb:
-        await message.answer_photo(thumb, caption=caption, reply_markup=kb)
+        await message.answer_photo(thumb, caption=preview_text, reply_markup=keyboard)
     else:
-        await message.answer(t(lang, "choose_category"), reply_markup=kb, link_preview_options=LinkPreviewOptions(is_disabled=True))
+        await message.answer(
+            preview_text,
+            reply_markup=keyboard,
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+        )
+
+
+@router.callback_query(F.data.startswith("menu|"))
+async def on_menu_navigation(cb: CallbackQuery) -> None:
+    lang = get_user_lang(cb.from_user.id) if cb.from_user else "ru"
+    try:
+        parts = (cb.data or "").split("|")
+        if len(parts) != 3:
+            await cb.answer("Bad", show_alert=True)
+            return
+        _, token, action = parts
+        payload = get_payload(token)
+        if not payload or not payload.get("url"):
+            await cb.answer(t(lang, "formats_unavailable"), show_alert=True)
+            return
+        url = payload["url"]
+        options = _options_from_payload(payload.get("options"))
+        if not options:
+            options = await probe_media_options(url)
+            if options:
+                payload["options"] = _options_to_payload(options)
+        if not options:
+            await cb.answer(t(lang, "formats_unavailable"), show_alert=True)
+            return
+
+        if action == "more":
+            keyboard = _build_full_keyboard(token, options, lang, url)
+            text = _render_menu_text(payload, lang, mode="full")
+        elif action == "back":
+            keyboard = _build_recommend_keyboard(token, options, lang, url)
+            text = _render_menu_text(payload, lang, mode="recommended")
+        else:
+            await cb.answer("Bad", show_alert=True)
+            return
+
+        await _edit_menu_message(cb.message, text, keyboard)
+        await cb.answer()
+    except Exception as exc:
+        logging.exception("menu navigation failed: %s", exc)
+        with suppress(Exception):
+            await cb.answer("Error", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("fmt|"))
@@ -661,7 +945,7 @@ async def on_format_selected(cb: CallbackQuery) -> None:
             return
         url = payload["url"]
         lang = get_user_lang(cb.from_user.id) if cb.from_user else "ru"
-        await cb.answer("OK")
+        await cb.answer()
         wait_msg = await cb.message.answer(t(lang, "queued", hint=_queue_hint(lang)))
         _schedule_download(cb.message, wait_msg, url, kind, quality, lang)
     except Exception:
@@ -678,111 +962,6 @@ async def on_lang_switch(cb: CallbackQuery) -> None:
         await cb.answer("OK")
         await cb.message.edit_text(t(code, "settings_saved", lang=("Русский" if code == "ru" else "English")))
 
-
-@router.callback_query(F.data.startswith("cat|"))
-async def on_category_selected(cb: CallbackQuery) -> None:
-    lang = get_user_lang(cb.from_user.id) if cb.from_user else "ru"
-    try:
-        parts = (cb.data or "").split("|")
-        if len(parts) != 3:
-            await cb.answer("Bad", show_alert=True)
-            return
-        _, token, cat = parts
-        payload = get_payload(token)
-        if not payload or not payload.get("url"):
-            await cb.answer("Expired", show_alert=True)
-            return
-        url = payload["url"]
-        opts = _options_from_payload(payload.get("options"))
-        if not opts:
-            opts = await probe_media_options(url)
-            if opts:
-                payload["options"] = _options_to_payload(opts)
-        if not opts:
-            await cb.answer(t(lang, "formats_unavailable"), show_alert=True)
-            return
-        if cat == "custom":
-            # Show detailed list
-            best_va = next((o for o in opts if o.kind == "va" and o.quality == "best"), None)
-            va_1080 = next((o for o in opts if o.kind == "va" and o.quality == "1080"), None)
-            va_720 = next((o for o in opts if o.kind == "va" and o.quality == "720"), None)
-            va_480 = next((o for o in opts if o.kind == "va" and o.quality == "480"), None)
-            va_360 = next((o for o in opts if o.kind == "va" and o.quality == "360"), None)
-            v_1080 = next((o for o in opts if o.kind == "v" and o.quality == "1080"), None)
-            v_720 = next((o for o in opts if o.kind == "v" and o.quality == "720"), None)
-            a_best = next((o for o in opts if o.kind == "a" and o.quality == "best"), None)
-
-            def mk_text(prefix: str, o) -> str:
-                parts = []
-                if getattr(o, "height", None):
-                    parts.append(f"{int(o.height)}p")
-                if getattr(o, "bitrate_k", None):
-                    mbps = float(o.bitrate_k) / 1000.0
-                    parts.append(f"{mbps:.1f} Mbps")
-                if getattr(o, "ext", None):
-                    parts.append(o.ext)
-                parts.append(f"~{human_size(o.est_size)}")
-                return f"{prefix} " + " • ".join(parts)
-
-            rows: list[list[InlineKeyboardButton]] = []
-            if best_va:
-                rows.append([InlineKeyboardButton(text=t(lang, "best_label"), callback_data=f"fmt|{token}|va|best")])
-            row = []
-            if va_1080:
-                row.append(InlineKeyboardButton(text=mk_text("🎥", va_1080)[:64], callback_data=f"fmt|{token}|va|1080"))
-            if va_720:
-                row.append(InlineKeyboardButton(text=mk_text("🎥", va_720)[:64], callback_data=f"fmt|{token}|va|720"))
-            if row:
-                rows.append(row)
-            row = []
-            if va_480:
-                row.append(InlineKeyboardButton(text=mk_text("🎥", va_480)[:64], callback_data=f"fmt|{token}|va|480"))
-            if va_360:
-                row.append(InlineKeyboardButton(text=mk_text("🎥", va_360)[:64], callback_data=f"fmt|{token}|va|360"))
-            if row:
-                rows.append(row)
-            row = []
-            if v_1080:
-                row.append(InlineKeyboardButton(text=mk_text("🎬", v_1080)[:64], callback_data=f"fmt|{token}|v|1080"))
-            if v_720:
-                row.append(InlineKeyboardButton(text=mk_text("🎬", v_720)[:64], callback_data=f"fmt|{token}|v|720"))
-            if row:
-                rows.append(row)
-            if a_best:
-                rows.append([InlineKeyboardButton(text=t(lang, "audio_only"), callback_data=f"fmt|{token}|a|best")])
-            # repeat/cancel
-            rows.append([
-                InlineKeyboardButton(text=t(lang, "repeat"), callback_data=f"cat|{token}|custom"),
-                InlineKeyboardButton(text=t(lang, "cancel"), callback_data=f"cat|{token}|cancel"),
-            ])
-
-            await cb.message.answer(t(lang, "pick_quality"), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
-            return
-
-        if cat == "cancel":
-            with suppress(Exception):
-                await cb.message.answer("✖️")
-            return
-
-        # fast/best shortcuts
-        best_va = next((o for o in opts if o.kind == "va" and o.quality == "best"), None)
-        va_opts = [o for o in opts if o.kind == "va" and o.est_size]
-        fastest = min(va_opts, key=lambda x: x.est_size or 10**18) if va_opts else None
-        target = None
-        if cat == "best" and best_va:
-            target = ("va", "best")
-        elif cat == "fast" and fastest:
-            target = ("va", fastest.quality)
-        else:
-            target = ("va", "best") if best_va else ("va", "720")
-
-        await cb.answer("OK")
-        wait_msg = await cb.message.answer(t(lang, "queued", hint=_queue_hint(lang)))
-        kind, quality = target
-        _schedule_download(cb.message, wait_msg, url, kind, quality, lang)
-    except Exception:
-        with suppress(Exception):
-            await cb.answer("Error", show_alert=True)
 
 
 async def _send_via_bot(message: Message, filepath: str, kind: str, caption: str | None) -> Message:
@@ -831,3 +1010,26 @@ async def on_userbot_private_upload(message: Message) -> None:
     except Exception:
         # ignore errors silently
         pass
+    else:
+        delivery_key = payload.get("delivery_key")
+        kind = str(payload.get("kind") or "document")
+        key_tuple: tuple[int, str, str, str] | None = None
+        if isinstance(delivery_key, (list, tuple)) and len(delivery_key) == 4:
+            try:
+                key_tuple = (
+                    int(delivery_key[0]),
+                    str(delivery_key[1]),
+                    str(delivery_key[2]),
+                    str(delivery_key[3]),
+                )
+            except Exception:
+                key_tuple = None
+        if key_tuple:
+            file_id = _extract_file_id(kind, message)
+            if file_id:
+                _store_file_delivery(
+                    key_tuple,
+                    kind,
+                    file_id,
+                    caption if isinstance(caption, str) else None,
+                )

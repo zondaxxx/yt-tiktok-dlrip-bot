@@ -19,6 +19,8 @@ except Exception:  # pragma: no cover
 
 _client: Optional[Client] = None
 _lock = asyncio.Lock()
+_dialog_lock = asyncio.Lock()
+_warm_dialogs: set[str] = set()
 
 
 async def get_user_client() -> Optional[Client]:
@@ -231,12 +233,21 @@ async def send_file_to_bot(
     else:
         progress_cb = progress
     file_name = _suggest_file_name(filepath)
+    async def _ensure_dialog() -> None:
+        key = to.lower().lstrip("@")
+        if not key:
+            return
+        async with _dialog_lock:
+            if key in _warm_dialogs:
+                return
+            try:
+                await client.send_message(to, "/start")
+            except Exception:
+                return
+            _warm_dialogs.add(key)
+
     try:
-        # Ensure the dialog with bot exists (equivalent to pressing Start)
-        try:
-            await client.send_message(to, "/start")
-        except Exception:
-            pass
+        await _ensure_dialog()
         if kind == "image":
             await client.send_photo(to, filepath, caption=caption or "", file_name=file_name, progress=progress_cb)
             return True

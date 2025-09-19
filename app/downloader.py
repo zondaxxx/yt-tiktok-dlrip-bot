@@ -2,16 +2,39 @@ import asyncio
 import os
 import shutil
 import tempfile
+import threading
+import time
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import partial
 from typing import Optional, Tuple, List, Dict, Callable
 
 import yt_dlp as ytdlp
 
 # Support running both as a module and as a script
 try:
-    from .config import get_ytdlp_cookies_file, get_ytdlp_cookies_from_browser  # type: ignore
+    from .config import (
+        get_ytdlp_cookies_file,
+        get_ytdlp_cookies_from_browser,
+        get_probe_concurrency,
+        get_download_concurrency,
+        get_metadata_cache_ttl,
+        get_metadata_cache_size,
+        get_thread_pool_workers,
+        get_ytdlp_fragment_concurrency,
+    )  # type: ignore
 except Exception:  # pragma: no cover
-    from config import get_ytdlp_cookies_file, get_ytdlp_cookies_from_browser
+    from config import (
+        get_ytdlp_cookies_file,
+        get_ytdlp_cookies_from_browser,
+        get_probe_concurrency,
+        get_download_concurrency,
+        get_metadata_cache_ttl,
+        get_metadata_cache_size,
+        get_thread_pool_workers,
+        get_ytdlp_fragment_concurrency,
+    )
 
 
 # Максимальный размер файла для отдачи пользователю через прямую ссылку
@@ -20,6 +43,63 @@ MAX_FILE_MB = 4096  # 4 ГБ
 
 # Мягкий предел для загрузки в Telegram ботом (у ботов ограничение ~50 МБ)
 TELEGRAM_UPLOAD_LIMIT_MB = 48
+
+
+_PROBE_CONCURRENCY = max(1, get_probe_concurrency())
+_DOWNLOAD_CONCURRENCY = max(1, get_download_concurrency())
+_METADATA_CACHE_TTL = max(0, get_metadata_cache_ttl())
+_METADATA_CACHE_SIZE = max(1, get_metadata_cache_size())
+_FRAGMENT_CONCURRENCY = max(1, get_ytdlp_fragment_concurrency())
+
+_THREAD_POOL = ThreadPoolExecutor(
+    max_workers=get_thread_pool_workers(),
+    thread_name_prefix="ytbot",
+)
+
+_probe_semaphore = asyncio.Semaphore(_PROBE_CONCURRENCY)
+_download_semaphore = asyncio.Semaphore(_DOWNLOAD_CONCURRENCY)
+
+_MetadataEntry = Tuple[float, Optional[dict], Optional[str]]
+_metadata_cache: "OrderedDict[str, _MetadataEntry]" = OrderedDict()
+_metadata_lock = threading.Lock()
+
+
+def _metadata_cache_get(url: str) -> Tuple[Optional[dict], Optional[str]] | None:
+    if _METADATA_CACHE_TTL <= 0:
+        return None
+    now = time.time()
+    with _metadata_lock:
+        entry = _metadata_cache.get(url)
+        if not entry:
+            return None
+        ts, info, err = entry
+        if (now - ts) > _METADATA_CACHE_TTL:
+            _metadata_cache.pop(url, None)
+            return None
+        _metadata_cache.move_to_end(url)
+        return info, err
+
+
+def _metadata_cache_set(url: str, info: Optional[dict], err: Optional[str]) -> None:
+    if _METADATA_CACHE_TTL <= 0:
+        return
+    now = time.time()
+    with _metadata_lock:
+        _metadata_cache[url] = (now, info, err)
+        _metadata_cache.move_to_end(url)
+        while len(_metadata_cache) > _METADATA_CACHE_SIZE:
+            _metadata_cache.popitem(last=False)
+
+
+async def _run_blocking_with_limit(
+    semaphore: asyncio.Semaphore,
+    func: Callable,
+    *args,
+    **kwargs,
+):
+    loop = asyncio.get_running_loop()
+    async with semaphore:
+        return await loop.run_in_executor(_THREAD_POOL, partial(func, *args, **kwargs))
 
 
 @dataclass
@@ -76,7 +156,7 @@ def _pick_kind(info: dict) -> str:
     return "document"
 
 
-def _extract_info(url: str) -> Tuple[Optional[dict], Optional[str]]:
+def _extract_info_uncached(url: str) -> Tuple[Optional[dict], Optional[str]]:
     try:
         ydl_opts = {
             "quiet": True,
@@ -89,6 +169,24 @@ def _extract_info(url: str) -> Tuple[Optional[dict], Optional[str]]:
             return info, None
     except Exception as e:  # noqa: BLE001
         return None, str(e)
+
+
+def _extract_info_sync(url: str) -> Tuple[Optional[dict], Optional[str]]:
+    cached = _metadata_cache_get(url)
+    if cached is not None:
+        return cached
+    info, err = _extract_info_uncached(url)
+    _metadata_cache_set(url, info, err)
+    return info, err
+
+
+async def _extract_info_async(url: str) -> Tuple[Optional[dict], Optional[str]]:
+    cached = _metadata_cache_get(url)
+    if cached is not None:
+        return cached
+    info, err = await _run_blocking_with_limit(_probe_semaphore, _extract_info_uncached, url)
+    _metadata_cache_set(url, info, err)
+    return info, err
 
 
 def _best_direct_url(info: dict, max_bytes: int) -> Optional[str]:
@@ -145,7 +243,7 @@ def _download(
 
     try:
         # Сначала извлечём метаданные, чтобы понять — пробуем ли качать под лимит TG
-        probe_info, _ = _extract_info(url)
+        probe_info, _ = _extract_info_sync(url)
         if not isinstance(probe_info, dict):
             raise RuntimeError("Failed to extract info")
 
@@ -218,6 +316,9 @@ def _download(
                 }
             ],
             "progress_hooks": [_hook],
+            "concurrent_fragment_downloads": _FRAGMENT_CONCURRENCY,
+            "retries": 10,
+            "fragment_retries": 20,
             **cookies_opts,
         }
 
@@ -280,7 +381,7 @@ def _download(
             )
     except Exception as e:  # noqa: BLE001
         # Пытаемся хотя бы вернуть метаданные и прямую ссылку
-        info, _ = _extract_info(url)
+        info, _ = _extract_info_sync(url)
         direct_url = None
         if isinstance(info, dict):
             direct_url = _best_direct_url(info, dl_max_bytes)
@@ -311,7 +412,14 @@ async def download_media(
 ) -> DownloadResult:
     tg_limit_bytes = max(1, telegram_limit_mb) * 1024 * 1024
     dl_max_bytes = max(1, download_max_mb) * 1024 * 1024
-    return await asyncio.to_thread(_download, url, tg_limit_bytes, dl_max_bytes, None)
+    return await _run_blocking_with_limit(
+        _download_semaphore,
+        _download,
+        url,
+        tg_limit_bytes,
+        dl_max_bytes,
+        None,
+    )
 
 
 # -------- Форматы и выбор качества ---------
@@ -437,33 +545,35 @@ def _estimate_sizes(info: dict) -> List[FormatOption]:
     aud = _pick_audio_fmt(formats)
     aud_size = (aud.get("filesize") or aud.get("filesize_approx")) if aud else None
 
-    # Audio only
-    opts.append(
-        FormatOption(
-            kind="a",
-            quality="best",
-            est_size=aud_size,
-            label=f"Только аудио (~{_human_size(aud_size)})",
-            bitrate_k=(aud.get("abr") or aud.get("tbr")) if aud else None,
-            ext=(aud.get("ext") if aud else None),
+    # Audio only (only if present)
+    if aud:
+        opts.append(
+            FormatOption(
+                kind="a",
+                quality="best",
+                est_size=aud_size,
+                label=f"Только аудио (~{_human_size(aud_size)})",
+                bitrate_k=(aud.get("abr") or aud.get("tbr")),
+                ext=aud.get("ext"),
+            )
         )
-    )
 
     # Video only for heights
     for h in heights:
         v = _pick_video_fmt(formats, h)
-        v_size = (v.get("filesize") or v.get("filesize_approx")) if v else None
-        opts.append(
-            FormatOption(
-                kind="v",
-                quality=str(h),
-                est_size=v_size,
-                label=f"Только видео {h}p (~{_human_size(v_size)})",
-                height=h,
-                bitrate_k=(v.get("tbr") if v else None),
-                ext=(v.get("ext") if v else None),
+        if v:
+            v_size = (v.get("filesize") or v.get("filesize_approx"))
+            opts.append(
+                FormatOption(
+                    kind="v",
+                    quality=str(h),
+                    est_size=v_size,
+                    label=f"Только видео {h}p (~{_human_size(v_size)})",
+                    height=h,
+                    bitrate_k=v.get("tbr"),
+                    ext=v.get("ext"),
+                )
             )
-        )
 
     # Video+audio
     for h in heights:
@@ -471,45 +581,56 @@ def _estimate_sizes(info: dict) -> List[FormatOption]:
         if v and aud:
             v_size = (v.get("filesize") or v.get("filesize_approx"))
             est = (v_size or 0) + (aud_size or 0)
+            candidate = v
         else:
             # Фолбек — прогрессивный формат
             p = _pick_progressive_fmt(formats, h)
-            est = (p.get("filesize") or p.get("filesize_approx")) if p else None
-            v = p or v
-        opts.append(
-            FormatOption(
-                kind="va",
-                quality=str(h),
-                est_size=est,
-                label=f"Видео+аудио {h}p (~{_human_size(est)})",
-                height=h,
-                bitrate_k=(v.get("tbr") if v else None) if v else None,
-                ext=(v.get("ext") if v else None) if v else None,
+            if p:
+                est = (p.get("filesize") or p.get("filesize_approx"))
+                candidate = p
+            else:
+                est = None
+                candidate = None
+        if candidate is not None and est is not None:
+            opts.append(
+                FormatOption(
+                    kind="va",
+                    quality=str(h),
+                    est_size=est,
+                    label=f"Видео+аудио {h}p (~{_human_size(est)})",
+                    height=h,
+                    bitrate_k=candidate.get("tbr"),
+                    ext=candidate.get("ext"),
+                )
             )
-        )
 
     # Best VA
     pbest = _pick_progressive_fmt(formats, None)
-    est_best = (pbest.get("filesize") or pbest.get("filesize_approx")) if pbest else None
-    opts.insert(
-        0,
-        FormatOption(
-            kind="va",
-            quality="best",
-            est_size=est_best,
-            label=f"Лучшее качество (~{_human_size(est_best)})",
-            height=(pbest.get("height") if pbest else None) if pbest else None,
-            bitrate_k=(pbest.get("tbr") if pbest else None) if pbest else None,
-            ext=(pbest.get("ext") if pbest else None) if pbest else None,
-        ),
-    )
+    if pbest:
+        est_best = (pbest.get("filesize") or pbest.get("filesize_approx"))
+        opts.insert(
+            0,
+            FormatOption(
+                kind="va",
+                quality="best",
+                est_size=est_best,
+                label=f"Лучшее качество (~{_human_size(est_best)})",
+                height=pbest.get("height"),
+                bitrate_k=pbest.get("tbr"),
+                ext=pbest.get("ext"),
+            ),
+        )
     return opts
 
 
 def get_basic_info(url: str) -> BasicInfo:
-    info, _ = _extract_info(url)
+    info, _ = _extract_info_sync(url)
     if not isinstance(info, dict):
         return BasicInfo(None, None, None, None, None)
+    return _basic_from_info(info)
+
+
+def _basic_from_info(info: dict) -> BasicInfo:
     w = None
     h = None
     # Try general fields first
@@ -531,6 +652,14 @@ def get_basic_info(url: str) -> BasicInfo:
         width=w,
         height=h,
     )
+
+
+async def fetch_media_metadata(url: str) -> Tuple[BasicInfo, List[FormatOption]]:
+    info, _ = await _extract_info_async(url)
+    if not isinstance(info, dict):
+        return BasicInfo(None, None, None, None, None), []
+    basic = _basic_from_info(info)
+    return basic, _estimate_sizes(info)
 
 
 def _download_with_selector(
@@ -581,6 +710,9 @@ def _download_with_selector(
             }
         ],
         "progress_hooks": [_hook],
+        "concurrent_fragment_downloads": _FRAGMENT_CONCURRENCY,
+        "retries": 10,
+        "fragment_retries": 20,
         **cookies_opts,
     }
     try:
@@ -619,7 +751,7 @@ def _download_with_selector(
                 kind=kind,
             )
     except Exception as e:  # noqa: BLE001
-        info, _ = _extract_info(url)
+        info, _ = _extract_info_sync(url)
         return DownloadResult(
             ok=False,
             filepath=None,
@@ -636,10 +768,8 @@ def _download_with_selector(
 
 
 async def probe_media_options(url: str) -> List[FormatOption]:
-    info, err = await asyncio.to_thread(_extract_info, url)
-    if not info:
-        return []
-    return _estimate_sizes(info)
+    _, opts = await fetch_media_metadata(url)
+    return opts
 
 
 async def download_media_selected(
@@ -660,4 +790,30 @@ async def download_media_selected(
         except Exception:
             pass
 
-    return await asyncio.to_thread(_download_with_selector, url, selector, _safe_progress)
+    # First attempt with chosen selector
+    res = await _run_blocking_with_limit(
+        _download_semaphore,
+        _download_with_selector,
+        url,
+        selector,
+        _safe_progress,
+    )
+    if res.ok:
+        return res
+    # Fallbacks for sources with limited formats (e.g., Pinterest)
+    err = (res.error or "").lower()
+    if ("requested format" in err) or ("no video formats" in err) or ("no such format" in err):
+        for sel in (
+            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "best",
+        ):
+            res2 = await _run_blocking_with_limit(
+                _download_semaphore,
+                _download_with_selector,
+                url,
+                sel,
+                _safe_progress,
+            )
+            if res2.ok:
+                return res2
+    return res

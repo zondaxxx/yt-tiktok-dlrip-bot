@@ -123,7 +123,12 @@ auth_youtube_flow() {
   case "${ans,,}" in
     y|yes)
       echo "Methods:"; echo "  1) Use existing cookies.txt path"; echo "  2) Import from local browser"; echo "  3) Sign in Google (opens Chrome) and auto-capture cookies"
-      read -r -p "Choose method [1/2/3]: " method || true
+      read -r -p "Choose method [1/2/3] (or paste full path to cookies.txt): " method || true
+      # Allow pasting path directly at the prompt
+      if [ -f "${method}" ]; then
+        CK="${method}"
+        method="1"
+      fi
       if [ "${method}" = "1" ]; then
         read -r -p "Path to cookies.txt (Netscape format): " CK || true
         if [ -f "$CK" ]; then

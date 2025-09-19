@@ -8,6 +8,7 @@ _TTL_SECONDS = 60 * 30  # 30 минут
 
 # Simple in-memory user preferences (language)
 _USER_LANG: Dict[int, str] = {}
+_USER_LAST_REQ: Dict[int, float] = {}
 
 
 def _cleanup() -> None:
@@ -39,3 +40,11 @@ def set_user_lang(user_id: int, lang: str) -> None:
 
 def get_user_lang(user_id: int) -> str:
     return _USER_LANG.get(user_id, "ru")
+
+
+def set_user_last_request(user_id: int, ts: float) -> None:
+    _USER_LAST_REQ[user_id] = ts
+
+
+def get_user_last_request(user_id: int) -> float | None:
+    return _USER_LAST_REQ.get(user_id)

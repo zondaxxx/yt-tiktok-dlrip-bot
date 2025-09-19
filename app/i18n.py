@@ -20,6 +20,8 @@ MESSAGES = {
         "error_download": "Произошла ошибка при скачивании. Попробуйте другую ссылку.",
         "queued": "⌛️ Поставил в очередь — всё скоро будет готово{hint}",
         "preparing": "🔄 Подбираю лучший источник…",
+        "queue_full": "🚦 Очередь переполнена. Попробуйте ещё раз через минуту.",
+        "queue_chat_full": "🙈 У вас уже несколько загрузок в обработке. Дождитесь окончания и повторите запрос.",
         "menu_recommended": "<b>Рекомендованные форматы</b>",
         "menu_full": "<b>Все варианты</b>",
         "menu_hint": "Нажмите кнопку ниже — и я начну загрузку.",
@@ -32,6 +34,9 @@ MESSAGES = {
         "opt_audio": "🎵 Аудио",
         "opt_video": "🎬 Видео",
         "meta_duration": "⏱ Длительность: {value}",
+        "cooldown_active": "⌚️ Сделайте паузу {seconds} с — запрос отправлен слишком быстро.",
+        "queue_status": "<b>Очередь</b>\nВсего задач: {total}\nСкачивается: {downloading}\nВаших запросов: {chat}",
+        "queue_limits": "Пределы: система {max_total} · на чат {max_chat} · задержка {cooldown}",
     },
     "en": {
         "start": "<b>Hey!</b> I’m your personal media concierge. Drop a link from YouTube, TikTok, Instagram or more — I’ll pick the perfect format and deliver it in style.",
@@ -52,6 +57,8 @@ MESSAGES = {
         "error_download": "Error while downloading. Try another link.",
         "queued": "⌛️ Added to the queue — getting everything ready{hint}",
         "preparing": "🔄 Lining up the best source…",
+        "queue_full": "🚦 Queue is at capacity right now. Please retry in a minute.",
+        "queue_chat_full": "🙈 You already have a few downloads running. Let them finish and try again.",
         "menu_recommended": "<b>Recommended formats</b>",
         "menu_full": "<b>All formats</b>",
         "menu_hint": "Tap a button to start the download.",
@@ -64,6 +71,9 @@ MESSAGES = {
         "opt_audio": "🎵 Audio",
         "opt_video": "🎬 Video",
         "meta_duration": "⏱ Duration: {value}",
+        "cooldown_active": "⌚️ Easy there! Try again in {seconds}s.",
+        "queue_status": "<b>Queue</b>\nTotal jobs: {total}\nDownloading now: {downloading}\nYour requests: {chat}",
+        "queue_limits": "Limits: global {max_total} · per chat {max_chat} · cooldown {cooldown}",
     },
 }
 

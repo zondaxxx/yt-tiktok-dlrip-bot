@@ -374,7 +374,7 @@ def _download(
                 ext=(info or {}).get("ext"),
                 filesize=size,
                 duration=(info or {}).get("duration"),
-                thumbnail=(info or {}).get("thumbnail"),
+                thumbnail=_pick_best_thumbnail(info or {}),
                 webpage_url=(info or {}).get("webpage_url") or url,
                 direct_url=None,
                 kind=kind,
@@ -630,6 +630,27 @@ def get_basic_info(url: str) -> BasicInfo:
     return _basic_from_info(info)
 
 
+def _pick_best_thumbnail(info: dict) -> Optional[str]:
+    thumb = info.get("thumbnail")
+    thumbs = info.get("thumbnails") or []
+    best_url = None
+    best_score = -1.0
+    for item in thumbs:
+        if not isinstance(item, dict):
+            continue
+        url = item.get("url") or item.get("source")
+        if not url:
+            continue
+        width = item.get("width") or 0
+        height = item.get("height") or 0
+        pref = item.get("preference") or 0
+        score = float(pref) * 1e6 + float(max(width, height))
+        if score > best_score:
+            best_score = score
+            best_url = url
+    return best_url or thumb
+
+
 def _basic_from_info(info: dict) -> BasicInfo:
     w = None
     h = None
@@ -648,7 +669,7 @@ def _basic_from_info(info: dict) -> BasicInfo:
     return BasicInfo(
         title=info.get("title"),
         duration=info.get("duration"),
-        thumbnail=info.get("thumbnail"),
+        thumbnail=_pick_best_thumbnail(info),
         width=w,
         height=h,
     )
@@ -745,7 +766,7 @@ def _download_with_selector(
                 ext=(info or {}).get("ext"),
                 filesize=size,
                 duration=(info or {}).get("duration"),
-                thumbnail=(info or {}).get("thumbnail"),
+                thumbnail=_pick_best_thumbnail(info or {}),
                 webpage_url=(info or {}).get("webpage_url") or url,
                 direct_url=None,
                 kind=kind,
@@ -759,7 +780,7 @@ def _download_with_selector(
             ext=(info or {}).get("ext") if info else None,
             filesize=None,
             duration=(info or {}).get("duration") if info else None,
-            thumbnail=(info or {}).get("thumbnail") if info else None,
+            thumbnail=_pick_best_thumbnail(info or {}) if info else None,
             webpage_url=(info or {}).get("webpage_url") if info else None,
             direct_url=_best_direct_url(info, MAX_FILE_MB * 1024 * 1024) if info else None,
             kind=_pick_kind(info) if info else None,

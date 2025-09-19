@@ -107,3 +107,18 @@ def get_thread_pool_workers() -> int:
 
 def get_ytdlp_fragment_concurrency() -> int:
     return _get_int_env("YTDLP_CONCURRENT_FRAGMENTS", default=8, min_value=1, max_value=32)
+
+
+def get_max_active_jobs() -> int:
+    """Hard cap on simultaneously scheduled downloads; 0 disables the limit."""
+    return _get_int_env("MAX_ACTIVE_JOBS", default=12, min_value=0, max_value=128)
+
+
+def get_max_chat_jobs() -> int:
+    """Limit queued downloads per chat to prevent a single chat from hogging the queue."""
+    return _get_int_env("MAX_CHAT_JOBS", default=3, min_value=0, max_value=32)
+
+
+def get_user_cooldown_seconds() -> int:
+    """Delay between successive download requests from the same user."""
+    return _get_int_env("USER_REQUEST_COOLDOWN", default=5, min_value=0, max_value=600)

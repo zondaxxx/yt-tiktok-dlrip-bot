@@ -34,8 +34,20 @@ try:
         fetch_media_metadata,
         DownloadResult,
     )  # type: ignore
-    from .config import get_bypass_mode  # type: ignore
-    from .state import put_payload, get_payload, get_user_lang, set_user_lang  # type: ignore
+    from .config import (  # type: ignore
+        get_bypass_mode,
+        get_max_active_jobs,
+        get_max_chat_jobs,
+        get_user_cooldown_seconds,
+    )
+    from .state import (  # type: ignore
+        put_payload,
+        get_payload,
+        get_user_lang,
+        set_user_lang,
+        get_user_last_request,
+        set_user_last_request,
+    )
     from .user_sender import send_file_via_user, send_file_to_bot  # type: ignore
     from .ui import human_size, human_time, progress_bar  # type: ignore
     from .i18n import t  # type: ignore
@@ -50,8 +62,20 @@ except Exception:  # pragma: no cover
         fetch_media_metadata,
         DownloadResult,
     )
-    from config import get_bypass_mode
-    from state import put_payload, get_payload, get_user_lang, set_user_lang
+    from config import (
+        get_bypass_mode,
+        get_max_active_jobs,
+        get_max_chat_jobs,
+        get_user_cooldown_seconds,
+    )
+    from state import (
+        put_payload,
+        get_payload,
+        get_user_lang,
+        set_user_lang,
+        get_user_last_request,
+        set_user_last_request,
+    )
     from user_sender import send_file_via_user, send_file_to_bot
     from ui import human_size, human_time, progress_bar
     from i18n import t
@@ -99,6 +123,11 @@ class DeliveryCacheEntry:
 
 _DELIVERY_CACHE: dict[tuple[int, str, str, str], DeliveryCacheEntry] = {}
 _CACHE_TTL_SECONDS = 15 * 60
+
+
+_MAX_ACTIVE_JOBS = max(0, get_max_active_jobs())
+_MAX_CHAT_JOBS = max(0, get_max_chat_jobs())
+_USER_COOLDOWN = max(0, get_user_cooldown_seconds())
 
 
 def _options_to_payload(options: list[FormatOption]) -> list[dict[str, object]]:
@@ -203,6 +232,32 @@ def _quality_value(opt: FormatOption) -> int:
     return 0
 
 
+def _matches_quality(opt: FormatOption, target: int) -> bool:
+    quality = str(opt.quality or "").lower()
+    quality = quality.rstrip("p")
+    aliases_4k = {"4k", "uhd", "2160"}
+    aliases_1080 = {"1080", "1080hd", "fhd", "fullhd"}
+    if quality.isdigit() and int(quality) == target:
+        return True
+    if target == 2160 and quality in aliases_4k:
+        return True
+    if target == 1080 and quality in aliases_1080:
+        return True
+    if opt.height and int(opt.height) == target:
+        return True
+    return False
+
+
+def _select_preferred_va_option(options: list[FormatOption]) -> FormatOption | None:
+    for target in (2160, 1080):
+        match = next((opt for opt in options if _matches_quality(opt, target)), None)
+        if match:
+            return match
+    if options:
+        return max(options, key=_quality_value)
+    return None
+
+
 def _format_size_localized(nbytes: int | None, lang: str) -> str:
     text = human_size(nbytes or 0)
     if lang == "en":
@@ -270,14 +325,18 @@ def _pick_recommended_options(options: list[FormatOption]) -> list[tuple[str, Fo
     used: set[tuple[str, str]] = set()
 
     if va_opts:
+        preferred = _select_preferred_va_option(va_opts)
         va_sorted = sorted(va_opts, key=_quality_value, reverse=True)
-        best = va_sorted[0]
-        recommended.append(("best", best))
-        used.add((best.kind, best.quality))
+        if preferred is None and va_sorted:
+            preferred = va_sorted[0]
+        if preferred:
+            recommended.append(("best", preferred))
+            used.add((preferred.kind, preferred.quality))
         sized = sorted(va_sorted, key=lambda o: o.est_size or 10**12)
-        if sized and sized[0] is not best:
-            recommended.append(("compact", sized[0]))
-            used.add((sized[0].kind, sized[0].quality))
+        compact_pick = next((opt for opt in sized if (opt.kind, opt.quality) not in used), None)
+        if compact_pick:
+            recommended.append(("compact", compact_pick))
+            used.add((compact_pick.kind, compact_pick.quality))
     elif v_opts:
         v_sorted = sorted(v_opts, key=_quality_value, reverse=True)
         recommended.append(("video", v_sorted[0]))
@@ -571,6 +630,22 @@ def _schedule_download(
         edit_progress=_make_progress_editor(wait_msg),
     )
 
+    async def _reject(reason_key: str) -> None:
+        try:
+            await listener.edit_progress(t(lang, reason_key), "error", None)
+        except Exception:
+            pass
+
+    if key not in _ACTIVE_JOBS:
+        if _MAX_ACTIVE_JOBS and len(_ACTIVE_JOBS) >= _MAX_ACTIVE_JOBS:
+            asyncio.create_task(_reject("queue_full"))
+            return
+        if _MAX_CHAT_JOBS:
+            active_for_chat = sum(1 for job in _ACTIVE_JOBS.values() if job.key[0] == origin_message.chat.id)
+            if active_for_chat >= _MAX_CHAT_JOBS:
+                asyncio.create_task(_reject("queue_chat_full"))
+                return
+
     cached = _get_cached_delivery(key)
     if cached:
         asyncio.create_task(_deliver_from_cache(listener, cached))
@@ -785,6 +860,41 @@ async def on_help(message: Message) -> None:
     )
 
 
+@router.message(Command("queue"))
+async def on_queue_status(message: Message) -> None:
+    lang = get_user_lang(message.from_user.id) if message.from_user else "ru"
+    total_jobs = len(_ACTIVE_JOBS)
+    active_downloads = len(_ACTIVE_DOWNLOADS)
+    chat_jobs = 0
+    if message.chat:
+        try:
+            chat_jobs = sum(1 for job in _ACTIVE_JOBS.values() if job.key[0] == message.chat.id)
+        except Exception:
+            chat_jobs = 0
+    text = t(
+        lang,
+        "queue_status",
+        total=total_jobs,
+        downloading=active_downloads,
+        chat=chat_jobs,
+    )
+    if _MAX_ACTIVE_JOBS or _MAX_CHAT_JOBS or _USER_COOLDOWN:
+        max_total_display = "∞" if _MAX_ACTIVE_JOBS <= 0 else str(_MAX_ACTIVE_JOBS)
+        max_chat_display = "∞" if _MAX_CHAT_JOBS <= 0 else str(_MAX_CHAT_JOBS)
+        if _USER_COOLDOWN:
+            cooldown_display = f"{_USER_COOLDOWN}s" if lang == "en" else f"{_USER_COOLDOWN} с"
+        else:
+            cooldown_display = "—"
+        text += "\n\n" + t(
+            lang,
+            "queue_limits",
+            max_total=max_total_display,
+            max_chat=max_chat_display,
+            cooldown=cooldown_display,
+        )
+    await message.answer(text, link_preview_options=LinkPreviewOptions(is_disabled=True))
+
+
 @router.message(Command("settings"))
 async def on_settings(message: Message) -> None:
     lang = get_user_lang(message.from_user.id) if message.from_user else "ru"
@@ -831,6 +941,16 @@ async def on_text_with_url(message: Message) -> None:
     url = _extract_url(message.text or "")
     if not url:
         return  # игнорируем любые не-ссылки
+
+    user_id = message.from_user.id if message.from_user else None
+    now_ts = time.time()
+    if _USER_COOLDOWN and user_id:
+        last = get_user_last_request(user_id)
+        if last and (now_ts - last) < _USER_COOLDOWN:
+            remain = int(_USER_COOLDOWN - (now_ts - last)) + 1
+            await message.answer(t(lang, "cooldown_active", seconds=max(1, remain)))
+            return
+        set_user_last_request(user_id, now_ts)
 
     # Сообщаем о действии
     with suppress(Exception):
